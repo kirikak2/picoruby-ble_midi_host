@@ -61,6 +61,8 @@ typedef struct {
     uint32_t rx_messages;
     uint32_t rx_dropped;
     uint32_t decode_errors;
+    uint32_t rx_late;         /* later than the latency allows: passed on at once */
+    int32_t  rx_latency_us;   /* correction in use (0: off) */
     uint32_t tx_messages;
     uint32_t tx_packets;
     uint32_t tx_dropped;
@@ -100,6 +102,11 @@ void BLE_MIDI_HOST_disconnect(int slot);
 int  BLE_MIDI_HOST_known(ble_midi_peer_t *out, int max);
 /* Forget a peripheral (disconnects it, removes its bond). 0 / -1 */
 int  BLE_MIDI_HOST_forget(const uint8_t addr[6]);
+
+/* Receive timing correction for every slot: -1 automatic (connection
+ * interval + margin), 0 off, otherwise microseconds (at most 100 ms) */
+void    BLE_MIDI_HOST_set_rx_latency(int32_t us);
+int32_t BLE_MIDI_HOST_rx_latency_setting(void);
 
 /* --- slots --- */
 int          BLE_MIDI_HOST_dev_status(int slot);

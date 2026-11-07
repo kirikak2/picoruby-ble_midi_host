@@ -47,6 +47,12 @@ static void c_enable(mrbc_vm *vm, mrbc_value v[], int argc)      { RET_BOOL(BLE_
 static void c_enabled(mrbc_vm *vm, mrbc_value v[], int argc)     { RET_BOOL(BLE_MIDI_HOST_is_enabled()); }
 static void c_ready(mrbc_vm *vm, mrbc_value v[], int argc)       { RET_BOOL(BLE_MIDI_HOST_is_ready()); }
 static void c_set_auto(mrbc_vm *vm, mrbc_value v[], int argc)    { BLE_MIDI_HOST_set_auto_connect(ARG_TRUE(1)); RET_BOOL(ARG_TRUE(1)); }
+static void c_rx_latency(mrbc_vm *vm, mrbc_value v[], int argc)  { SET_INT_RETURN(BLE_MIDI_HOST_rx_latency_setting()); }
+static void c_set_rx_latency(mrbc_vm *vm, mrbc_value v[], int argc)
+{
+    if (argc >= 1 && v[1].tt == MRBC_TT_INTEGER) BLE_MIDI_HOST_set_rx_latency((int32_t)v[1].i);
+    SET_INT_RETURN(BLE_MIDI_HOST_rx_latency_setting());
+}
 static void c_auto(mrbc_vm *vm, mrbc_value v[], int argc)        { RET_BOOL(BLE_MIDI_HOST_auto_connect()); }
 static void c_scan_start(mrbc_vm *vm, mrbc_value v[], int argc)  { RET_BOOL(BLE_MIDI_HOST_scan_start((uint32_t)ARG_INT(1)) == 0); }
 static void c_scan_stop(mrbc_vm *vm, mrbc_value v[], int argc)   { BLE_MIDI_HOST_scan_stop(); SET_NIL_RETURN(); }
@@ -121,6 +127,7 @@ static void c_dev_info(mrbc_vm *vm, mrbc_value v[], int argc)
     hset(&h, "status", mrbc_symbol_value(mrbc_str_to_symid(STATUS_NAMES[s])));
     hset(&h, "mtu", mrbc_integer_value(st.mtu));
     hset(&h, "rx_messages", mrbc_integer_value(st.rx_messages));
+    hset(&h, "rx_late", mrbc_integer_value(st.rx_late));
     hset(&h, "tx_messages", mrbc_integer_value(st.tx_messages));
     hset(&h, "tx_dropped", mrbc_integer_value(st.tx_dropped));
     hset(&h, "last_error", mrbc_integer_value(st.last_error));
@@ -164,6 +171,8 @@ mrbc_ble_midi_host_init(mrbc_vm *vm)
     mrbc_define_method(vm, cls, "_enabled",         c_enabled);
     mrbc_define_method(vm, cls, "_ready",           c_ready);
     mrbc_define_method(vm, cls, "_set_auto",        c_set_auto);
+    mrbc_define_method(vm, cls, "_rx_latency",      c_rx_latency);
+    mrbc_define_method(vm, cls, "_set_rx_latency",  c_set_rx_latency);
     mrbc_define_method(vm, cls, "_auto",            c_auto);
     mrbc_define_method(vm, cls, "_scan_start",      c_scan_start);
     mrbc_define_method(vm, cls, "_scan_stop",       c_scan_stop);

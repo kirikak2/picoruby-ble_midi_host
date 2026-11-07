@@ -31,7 +31,8 @@
 #include "host/ble_store.h"
 
 #include "nimble_owner.h"       /* picoruby-ble's ESP32 port */
-#include "ble_midi_codec.h"     /* picoruby-midi */
+#include "ble_midi_codec.h"
+#include "midi_timed_ring.h"     /* picoruby-midi */
 #include "midi.h"
 #include "midi_route.h"
 
@@ -46,7 +47,6 @@ static const char *TAG = "BLE_MIDI_HOST";
 #define NB_SCAN_STOP   0x10
 #define NB_CONNECT     0x20
 
-#define RX_MASK (BLE_MIDI_HOST_RX_PACKETS - 1)
 #define TX_MASK (BLE_MIDI_HOST_TX_PACKETS - 1)
 #define TX_BUF_MAX 512
 #define CCCD_UUID 0x2902
@@ -75,9 +75,11 @@ typedef struct {
     midi_transport_t transport;
     midi_tmask_t bit;
 
-    uint8_t (*rx)[4];
-    volatile uint32_t rx_head, rx_tail;
+    midi_timed_ring_t *rx;
     ble_midi_decoder_t dec;
+    ble_midi_sync_t sync;
+    int64_t rx_now;                   /* arrival of the packet being decoded */
+    int32_t rx_budget;
 
     tx_entry_t *tx;
     volatile uint32_t tx_head, tx_tail;
@@ -268,18 +270,23 @@ static void known_remember(const slot_t *s)
  * RX / TX
  * ------------------------------------------------------------------- */
 
+static volatile int32_t s_rx_latency = BLE_MIDI_HOST_RX_LATENCY_US;
+
+static int32_t rx_budget(const slot_t *s)
+{
+    int32_t l = s_rx_latency;
+    if (l < 0) return ble_midi_sync_auto_budget(s->stats.interval_1250us);
+    return l;
+}
+
 static void rx_push(void *arg, const uint8_t pkt[4], uint16_t ts)
 {
-    (void)ts;
     slot_t *s = (slot_t *)arg;
-    uint32_t head = s->rx_head;
-    uint32_t next = (head + 1) & RX_MASK;
-    if (next == s->rx_tail) {
+    int64_t at = ble_midi_sync_release(&s->sync, ts, s->rx_now, s->rx_budget);
+    if (!midi_timed_ring_push(s->rx, pkt, at)) {
         s->stats.rx_dropped++;
         return;
     }
-    memcpy(s->rx[head], pkt, 4);
-    s->rx_head = next;
     s->stats.rx_messages++;
 }
 
@@ -507,7 +514,8 @@ static void slot_link_down(slot_t *s)
     s->mtu = 23;
     tx_clear(s);
     ble_midi_decoder_reset(&s->dec);
-    s->rx_head = s->rx_tail = 0;
+    ble_midi_sync_reset(&s->sync);
+    if (s->rx) midi_timed_ring_clear(s->rx);
 }
 
 static void results_add(const struct ble_gap_disc_desc *d)
@@ -560,6 +568,18 @@ static void maybe_reconnect(const struct ble_gap_disc_desc *d)
     BLE_MIDI_HOST_connect(msb, d->addr.type);
 }
 
+/* Scans and connection setup are claimed from the shared host
+ * (nimble_owner.h); a script's BLE class takes them over */
+static picoruby_nimble_client_t s_client;
+static volatile int s_preempted = -1;      /* slot whose connect the BLE class cancelled */
+
+static void central_done(void)
+{
+    if (!s_scanning && s_connecting < 0) {
+        picoruby_nimble_unclaim(&s_client, PICORUBY_NIMBLE_PROC_CENTRAL);
+    }
+}
+
 static int gap_event(struct ble_gap_event *event, void *arg)
 {
     switch (event->type) {
@@ -570,13 +590,21 @@ static int gap_event(struct ble_gap_event *event, void *arg)
 
     case BLE_GAP_EVENT_DISC_COMPLETE:
         s_scanning = false;
+        central_done();
         wake(NB_CONNECT);   /* a connect may wait for the scan to end */
         break;
 
     case BLE_GAP_EVENT_CONNECT: {
         slot_t *s = (slot_t *)arg;
         s_connecting = -1;
+        central_done();
         if (s == NULL) break;
+        if (event->connect.status != 0 && slot_index(s) == s_preempted) {
+            /* the BLE class needed the central: try again when it is free */
+            s_preempted = -1;
+            s_connect_slot = slot_index(s);
+            break;
+        }
         if (event->connect.status != 0) {
             ESP_LOGW(TAG, "slot %d: connect failed (%d)", slot_index(s), event->connect.status);
             s->stats.last_error = event->connect.status;
@@ -643,7 +671,10 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         if (len > sizeof(buf)) len = sizeof(buf);
         if (os_mbuf_copydata(event->notify_rx.om, 0, len, buf) != 0) break;
         s->stats.rx_packets++;
+        s->rx_now = esp_timer_get_time();
+        s->rx_budget = rx_budget(s);
         ble_midi_decode(&s->dec, buf, len, rx_push, s);
+        midi_timed_ring_commit(s->rx);
         s->stats.decode_errors = s->dec.errors;
         break;
     }
@@ -670,6 +701,11 @@ static void start_scan(bool user, uint32_t ms)
         s_scanning = false;
         return;
     }
+    if (!picoruby_nimble_claim(&s_client, PICORUBY_NIMBLE_PROC_CENTRAL)) {
+        if (user) ESP_LOGW(TAG, "scan: the BLE class is scanning or connecting");
+        s_scanning = false;
+        return;
+    }
     if (s_scanning) ble_gap_disc_cancel();
     struct ble_gap_disc_params p;
     memset(&p, 0, sizeof(p));
@@ -685,7 +721,10 @@ static void start_scan(bool user, uint32_t ms)
     s_scan_is_user = user;
     int rc = ble_gap_disc(picoruby_nimble_own_addr_type(), (int32_t)ms, &p, gap_event, NULL);
     s_scanning = (rc == 0);
-    if (rc != 0) ESP_LOGW(TAG, "scan: %d", rc);
+    if (rc != 0) {
+        ESP_LOGW(TAG, "scan: %d", rc);
+        central_done();
+    }
 }
 
 static void do_connect(void)
@@ -697,6 +736,9 @@ static void do_connect(void)
         s_connect_slot = -1;
         if (s) slot_link_down(s);
         return;
+    }
+    if (!picoruby_nimble_claim(&s_client, PICORUBY_NIMBLE_PROC_CENTRAL)) {
+        return;     /* kept in s_connect_slot: proc_free wakes us */
     }
     if (s_scanning) {
         ble_gap_disc_cancel();
@@ -719,6 +761,7 @@ static void do_connect(void)
         ESP_LOGW(TAG, "slot %d: connect: %d", i, rc);
         s->stats.last_error = rc;
         s_connecting = -1;
+        central_done();
         slot_link_down(s);
     }
 }
@@ -765,15 +808,38 @@ static void client_on_reset(int reason)
     (void)reason;
     s_scanning = false;
     s_connecting = -1;
+    s_preempted = -1;
     for (int i = 0; i < BLE_MIDI_HOST_MAX_DEVICES; i++) {
         if (s_slots[i].status != BLE_MIDI_HOST_SLOT_FREE) slot_link_down(&s_slots[i]);
     }
+}
+
+/* The BLE class took the central (its scan or connect) */
+static void client_yield(int proc)
+{
+    if (proc != PICORUBY_NIMBLE_PROC_CENTRAL) return;
+    if (s_scanning) {
+        ble_gap_disc_cancel();
+        s_scanning = false;
+    }
+    int c = s_connecting;
+    if (c >= 0) {
+        s_preempted = c;
+        ble_gap_conn_cancel();      /* CONNECT (cancelled) puts it back in s_connect_slot */
+    }
+}
+
+static void client_proc_free(int proc)
+{
+    if (proc == PICORUBY_NIMBLE_PROC_CENTRAL) wake(NB_CONNECT);
 }
 
 static picoruby_nimble_client_t s_client = {
     .name = "BLE-MIDI host",
     .configure = client_configure,
     .on_reset = client_on_reset,
+    .yield = client_yield,
+    .proc_free = client_proc_free,
 };
 
 static void do_enable(void)
@@ -781,7 +847,7 @@ static void do_enable(void)
     if (!s_wanted || s_held) return;
     int rc = picoruby_nimble_acquire(&s_client);
     if (rc != 0) {
-        ESP_LOGE(TAG, "%s", rc == -2 ? "BLE is held by the BLE class" : "BLE host did not start");
+        ESP_LOGE(TAG, "BLE host did not start");
         s_wanted = false;
         return;
     }
@@ -797,6 +863,7 @@ static void do_disable(void)
     s_scanning = false;
     if (s_connecting >= 0) ble_gap_conn_cancel();
     s_connecting = -1;
+    central_done();
     for (int i = 0; i < BLE_MIDI_HOST_MAX_DEVICES; i++) {
         slot_t *s = &s_slots[i];
         if (s->status != BLE_MIDI_HOST_SLOT_FREE && s->status != BLE_MIDI_HOST_SLOT_CONNECTING) {
@@ -823,6 +890,7 @@ static void host_task(void *arg)
         if (bits & NB_SCAN_STOP) {
             if (s_scanning) ble_gap_disc_cancel();
             s_scanning = false;
+            central_done();
         }
         if (bits & NB_SCAN) start_scan(true, s_scan_ms);
         if (s_connect_slot >= 0) do_connect();
@@ -898,7 +966,7 @@ int BLE_MIDI_HOST_init(void)
     if (!s_slots || !s_results) goto fail;
     for (int i = 0; i < BLE_MIDI_HOST_MAX_DEVICES; i++) {
         slot_t *s = &s_slots[i];
-        s->rx = heap_caps_calloc(BLE_MIDI_HOST_RX_PACKETS, 4, MALLOC_CAP_8BIT);
+        if (s->rx == NULL) s->rx = midi_timed_ring_new(BLE_MIDI_HOST_RX_PACKETS, "ble_midi_host_rx");
         s->tx = heap_caps_calloc(BLE_MIDI_HOST_TX_PACKETS, sizeof(tx_entry_t), MALLOC_CAP_8BIT);
         s->txbuf = heap_caps_malloc(TX_BUF_MAX, MALLOC_CAP_8BIT);
         if (!s->rx || !s->tx || !s->txbuf) goto fail;
@@ -924,7 +992,7 @@ fail:
     ESP_LOGE(TAG, "out of memory");
     if (s_slots) {
         for (int i = 0; i < BLE_MIDI_HOST_MAX_DEVICES; i++) {
-            heap_caps_free(s_slots[i].rx);
+            midi_timed_ring_free(s_slots[i].rx);
             heap_caps_free(s_slots[i].tx);
             heap_caps_free(s_slots[i].txbuf);
         }
@@ -1180,6 +1248,8 @@ void BLE_MIDI_HOST_dev_stats(int slot, ble_midi_host_stats_t *out)
     *out = s->stats;
     out->status = s->status;
     out->mtu = s->mtu;
+    out->rx_late = s->sync.late;
+    out->rx_latency_us = rx_budget(s);
 }
 
 int BLE_MIDI_HOST_dev_send_packet(int slot, uint8_t cable, uint8_t cin,
@@ -1219,23 +1289,24 @@ int BLE_MIDI_HOST_dev_bytes_available(int slot)
 {
     slot_t *s = slot_at(slot);
     if (s == NULL) return 0;
-    return (int)(((s->rx_head - s->rx_tail) & RX_MASK) * 4);
+    return s->rx ? midi_timed_ring_bytes_due(s->rx) : 0;
 }
 
 int BLE_MIDI_HOST_dev_read_packet(int slot, uint8_t *buf, size_t maxlen)
 {
     slot_t *s = slot_at(slot);
-    if (s == NULL) return 0;
-    size_t n = 0;
-    while (n + 4 <= maxlen) {
-        uint32_t tail = s->rx_tail;
-        if (tail == s->rx_head) break;
-        memcpy(buf + n, s->rx[tail], 4);
-        s->rx_tail = (tail + 1) & RX_MASK;
-        n += 4;
-    }
-    return (int)n;
+    if (s == NULL || s->rx == NULL) return 0;
+    return midi_timed_ring_read(s->rx, buf, maxlen);
 }
+
+void BLE_MIDI_HOST_set_rx_latency(int32_t us)
+{
+    if (us < -1) us = -1;
+    if (us > 100000) us = 100000;
+    s_rx_latency = us;
+}
+
+int32_t BLE_MIDI_HOST_rx_latency_setting(void) { return s_rx_latency; }
 
 static bool contains_ci(const char *hay, const char *needle)
 {
@@ -1278,6 +1349,8 @@ int  BLE_MIDI_HOST_connect(const uint8_t addr[6], uint8_t addr_type) { (void)add
 void BLE_MIDI_HOST_disconnect(int slot) { (void)slot; }
 int  BLE_MIDI_HOST_known(ble_midi_peer_t *out, int max) { (void)out; (void)max; return 0; }
 int  BLE_MIDI_HOST_forget(const uint8_t addr[6]) { (void)addr; return -1; }
+void BLE_MIDI_HOST_set_rx_latency(int32_t us) { (void)us; }
+int32_t BLE_MIDI_HOST_rx_latency_setting(void) { return 0; }
 int  BLE_MIDI_HOST_dev_status(int slot) { (void)slot; return BLE_MIDI_HOST_SLOT_FREE; }
 midi_tmask_t BLE_MIDI_HOST_dev_bit(int slot) { (void)slot; return 0; }
 bool BLE_MIDI_HOST_dev_connected(int slot) { (void)slot; return false; }

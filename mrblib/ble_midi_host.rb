@@ -17,9 +17,9 @@ class BLE_MIDI_HOST
   end
 
   # Hold the BLE host and reconnect the remembered peripherals (true), or
-  # drop every link (false; waits until it is done, up to 3 s, so that a
-  # script can use the BLE class right after). For this script only: the
-  # saved setting comes back when it ends.
+  # drop every link (false; waits until it is done, up to 3 s). The BLE
+  # class works alongside: its scans and connects go first, ours wait. For
+  # this script only: the saved setting comes back when it ends.
   def self.enable=(on)
     _enable(on ? true : false)
     return if on
@@ -45,6 +45,26 @@ class BLE_MIDI_HOST
 
   def self.auto_connect?
     _auto
+  end
+
+  # Receive timing correction for every peripheral (docs/BLE_MIDI.md §8):
+  # messages keep the spacing of the sender's timestamps, this much later.
+  # :auto (connection interval plus a margin, the default), 0 / false / :off,
+  # or milliseconds (at most 100). Until the script ends.
+  def self.rx_latency
+    us = _rx_latency
+    us < 0 ? :auto : us / 1000.0
+  end
+
+  def self.rx_latency=(ms)
+    us = case ms
+         when :auto, nil, true then -1
+         when :off, false then 0
+         else
+           v = (ms * 1000).to_i
+           v < 0 ? 0 : v
+         end
+    _set_rx_latency(us)
   end
 
   # The object for a slot (slot 0 is the first peripheral connected)

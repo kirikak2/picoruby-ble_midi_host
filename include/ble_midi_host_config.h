@@ -61,6 +61,12 @@
 #define BLE_MIDI_HOST_TX_PACKETS 256
 #endif
 
+/* Receive timing correction (docs/BLE_MIDI.md §8), microseconds: -1 the
+ * connection interval plus a margin, 0 off */
+#ifndef BLE_MIDI_HOST_RX_LATENCY_US
+#define BLE_MIDI_HOST_RX_LATENCY_US (-1)
+#endif
+
 #ifndef BLE_MIDI_HOST_TX_BATCH_US
 #define BLE_MIDI_HOST_TX_BATCH_US 1000
 #endif
